@@ -1,154 +1,107 @@
-import ldap
-import ldap.filter
-import argparse
-import sys
+from ldap3 import Server, Connection, ALL, SUBTREE
+from ldap3.core.exceptions import LDAPException
 import logging
-from ldap.controls import SimplePagedResultsControl
+from rich.console import Console
+from rich.table import Table
+from rich.prompt import Prompt, Confirm
+from rich.panel import Panel
+from rich.progress import Progress
 
 class LDAPTester:
-    PASSWORD_KEY = "userPassword"
-    CN_KEY = "cn"
-    SN_KEY = "sn"
-    PAGE_SIZE = 1000
-    
-    def __init__(self, hostname, out, port, timeout=3):
-        self.hostname = hostname
-        self.port = port
-        self.out = out
-        self.timeout = timeout
-        self.logger = logging.getLogger(__name__)
-        
-    def null_bind(self):
-        try:
-            self.logger.info("Testing host %s", self.hostname)
-            self.l = ldap.initialize(f"ldap://{self.hostname}:{self.port}")
-            self.l.set_option(ldap.OPT_NETWORK_TIMEOUT, self.timeout)
-            self.l.set_option(ldap.OPT_TIMEOUT, self.timeout)
+    def __init__(self, hostname, port, out, timeout=3):
+        self.hostname = hostname
+        self.port = port
+        self.out = out
+        self.timeout = timeout
+        self.logger = logging.getLogger(__name__)
+        self.console = Console()
+        self.server = Server(f"{self.hostname}:{self.port}", get_info=ALL)
 
-            self.l.simple_bind_s("", "")
-            self.logger.info("Null bind is allowed, making a search to catch INSUFFICIENT_ACCESS error.")
+    def null_bind(self):
+        try:
+            self.logger.info("Testing host %s", self.hostname)
+            self.conn = Connection(self.server, auto_bind=True)
+            self.logger.info("Null bind is allowed, making a search to catch INSUFFICIENT_ACCESS error.")
+            self.conn.search(search_base='', search_filter='(objectClass=*)', search_scope=SUBTREE, attributes=['*'])
+            self.logger.info("Null bind allowed for host %s", self.hostname)
+            return True
+        except LDAPException as e:
+            self.logger.error("Error while testing null bind: %s", e)
+            return False
 
-            self.l.search_s("", ldap.SCOPE_SUBTREE)
-            self.logger.info("Null bind allowed for host %s", self.hostname)
+    def find_passwords(self):
+        self.passwords = []
+        try:
+            self.logger.info("Looking for passwords")
+            self.conn.search(search_base='', search_filter='(objectClass=*)', search_scope=SUBTREE, attributes=['userPassword', 'cn', 'sn'])
+            for entry in self.conn.entries:
+                self.passwords.append([entry.entry_dn, entry.userPassword.value, entry.cn.value, entry.sn.value])
+        except LDAPException as e:
+            self.logger.error("Error while finding passwords: %s", e)
 
-            return True
-        except ldap.NO_SUCH_OBJECT:
-            self.logger.info("Null bind allowed for host %s", self.hostname)
-            return True
-        except (ldap.OPERATIONS_ERROR, ldap.INSUFFICIENT_ACCESS, ldap.TIMEOUT, ldap.SERVER_DOWN) as e:
-            self.logger.error("Error while testing null bind: %s", e)
-            return False
-
-    def get_naming_contexts(self):
-        try:
-            res = self.l.search_s("", ldap.SCOPE_BASE, attrlist=["+"])
-            self.naming_contexts = res[0][1].get("namingContexts", [])
-            if len(self.naming_contexts) > 0:
-                self.logger.info("Found naming contexts: %s", self.naming_contexts)
-                return True
-            return False
-        except Exception as e:
-            self.logger.error("Error while getting naming context: %s", e)
-            return False
-
-    def find_passwords(self):
-        self.passwords = []
-        known_ldap_resp_ctrls = {
-            SimplePagedResultsControl.controlType: SimplePagedResultsControl,
-        }
-        
-        for naming_ctx in self.naming_contexts:
-            try:
-                lc = SimplePagedResultsControl(True, size=LDAPTester.PAGE_SIZE, cookie='')
-                self.logger.info("Looking for passwords in context %s", naming_ctx)
-                msgid = self.l.search_ext(naming_ctx, ldap.SCOPE_SUBTREE, attrlist=["*"], serverctrls=[lc])
-                
-                pages = 0
-                while True:
-                    pages += 1
-                    self.logger.info("Getting page %s", pages)
-                    rtype, rdata, rmsgid, serverctrls = self.l.result3(msgid, resp_ctrl_classes=known_ldap_resp_ctrls)
-
-                    for entity in rdata:
-                        entry = [entity[0]]
-                        if LDAPTester.PASSWORD_KEY in entity[1]:
-                            entry.append(entity[1][LDAPTester.PASSWORD_KEY][0])
-                            
-                            if LDAPTester.CN_KEY in entity[1]:
-                                entry.append(entity[1][LDAPTester.CN_KEY][0])
-                            else:
-                                entry.append("")
-
-                            if LDAPTester.SN_KEY in entity[1]:
-                                entry.append(entity[1][LDAPTester.SN_KEY][0])
-                            else:
-                                entry.append("")
-                        
-                            self.passwords.append(entry)
-
-                    pctrls = [c for c in serverctrls if c.controlType == SimplePagedResultsControl.controlType]
-                    if pctrls:
-                        if pctrls[0].cookie:
-                            lc.cookie = pctrls[0].cookie
-                            msgid = self.l.search_ext(naming_ctx, ldap.SCOPE_SUBTREE, attrlist=["*"], serverctrls=[lc])
-                        else:
-                            break
-                    else:
-                        self.logger.warning("Server ignores RFC 2696 control.")
-                        break
-                    
-            except ldap.LDAPError as e:
-                self.logger.error("Could not pull LDAP results: %s", e)
-            except Exception as e:
-                self.logger.error("Error while finding passwords: %s", e)
-        
-    def dump_passwords(self):
-        filename = f"{self.out}/{self.hostname}.passwords.lst"
-        self.logger.info("Dumping passwords into %s", filename)
-        try:
-            with open(filename, "w") as out:
-                for passwd in self.passwords:
-                    out.write(f"{passwd[0]}:{passwd[1]}:{passwd[2]}\n")
-        except Exception as e:
-            self.logger.error("Error while dumping passwords: %s", e)
-
-
-def get_args():
-    p = argparse.ArgumentParser(description="Test an LDAP server for null bind, base dn, and dump the content.",
-                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    p.add_argument("out", type=str, help="Output directory, will be created if it doesn't exist")
-    p.add_argument("--host", help="Host to scan")
-    p.add_argument("--port", type=int, default=389, help="Port on which the LDAP server is listening")
-    p.add_argument("--host-file", type=str, help="File containing a list of hosts in the format host:port")
-    return p.parse_args()
-
+    def dump_passwords(self):
+        filename = f"{self.out}/{self.hostname}.passwords.lst"
+        self.logger.info("Dumping passwords into %s", filename)
+        try:
+            with open(filename, "w") as out:
+                for passwd in self.passwords:
+                    out.write(f"{passwd[0]}:{passwd[1]}:{passwd[2]}\n")
+        except Exception as e:
+            self.logger.error("Error while dumping passwords: %s", e)
 
 def setup_logger():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-    logger = logging.getLogger(__name__)
-    logger.addHandler(logging.StreamHandler())
-    return logger
-
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    logger = logging.getLogger(__name__)
+    logger.addHandler(logging.StreamHandler())
+    return logger
 
 def main():
-    args = get_args()
-    logger = setup_logger()
-    
-    if args.host_file:
-        targets = [i.split(":") for i in open(args.host_file, "r").read().split("\n") if ":" in i]
-    else:
-        targets = [[args.host, args.port]]
-        
-    with open(f"{args.out}/out.lst", "w") as result:
-        for t in targets:
-            ldapTester = LDAPTester(t[0], args.out, t[1])
-            if ldapTester.null_bind():
-                if ldapTester.get_naming_contexts():
-                    ldapTester.find_passwords()
-                    ldapTester.dump_passwords()
-                    result.write(t[0] + "\n")
-                    logger.info("LDAP testing completed for host %s", t[0])
+    logger = setup_logger()
+    console = Console()
 
+    console.print(Panel("LDAP Tester", title="Welcome", subtitle="Test LDAP Servers", border_style="bold blue"))
+
+    # Input loop for user data
+    while True:
+        hostname = Prompt.ask("Enter the LDAP server hostname")
+        port = Prompt.ask("Enter the LDAP server port", default="389")
+        output_dir = Prompt.ask("Enter the output directory")
+
+        if Confirm.ask(f"Are you sure you want to test LDAP server {hostname}:{port} and save results to {output_dir}?"):
+            break
+
+    ldapTester = LDAPTester(hostname, int(port), output_dir)
+
+    with Progress() as progress:
+        task = progress.add_task("[cyan]Testing null bind...", total=None)
+        
+        if ldapTester.null_bind():
+            progress.update(task, advance=1)
+            console.print("[green]Null bind successful![/green]")
+            
+            task = progress.add_task("[cyan]Finding passwords...", total=None)
+            ldapTester.find_passwords()
+            progress.update(task, advance=1)
+            
+            task = progress.add_task("[cyan]Dumping passwords...", total=None)
+            ldapTester.dump_passwords()
+            progress.update(task, advance=1)
+            
+            console.print(f"[blue]Results saved to {output_dir}/{hostname}.passwords.lst[/blue]")
+            
+            # Display results in a formatted table
+            table = Table(show_header=True, header_style="bold magenta")
+            table.add_column("DN", style="dim", width=40)
+            table.add_column("Password", style="dim", width=30)
+            table.add_column("CN", style="dim", width=20)
+            table.add_column("SN", style="dim", width=20)
+
+            for passwd in ldapTester.passwords:
+                table.add_row(passwd[0], passwd[1] if passwd[1] else "N/A", passwd[2] if passwd[2] else "N/A", passwd[3] if passwd[3] else "N/A")
+
+            console.print(table)
+        else:
+            console.print("[red]Null bind failed! Please check your credentials and server settings.[/red]")
 
 if __name__ == "__main__":
-    main()
+    main()
