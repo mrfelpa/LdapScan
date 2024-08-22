@@ -61,7 +61,6 @@ def main():
 
     console.print(Panel("LDAP Tester", title="Welcome", subtitle="Test LDAP Servers", border_style="bold blue"))
 
-    # Input loop for user data
     while True:
         hostname = Prompt.ask("Enter the LDAP server hostname")
         port = Prompt.ask("Enter the LDAP server port", default="389")
@@ -89,7 +88,6 @@ def main():
             
             console.print(f"[blue]Results saved to {output_dir}/{hostname}.passwords.lst[/blue]")
             
-            # Display results in a formatted table
             table = Table(show_header=True, header_style="bold magenta")
             table.add_column("DN", style="dim", width=40)
             table.add_column("Password", style="dim", width=30)
